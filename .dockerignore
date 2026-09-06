@@ -1,0 +1,8 @@
+# 只讓程式碼進 image
+.env
+.git
+node_modules
+*.md
+*.sql
+*.sh
+docker-compose*.yml
