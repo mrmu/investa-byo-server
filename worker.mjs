@@ -373,6 +373,14 @@ if (process.argv[2] === "--rebuild") {
  */
 const BACKFILL_DAYS = Number(process.env.BACKFILL_DAYS || 1095); // 預設三年
 const BACKFILL_SLEEP_MS = Number(process.env.BACKFILL_SLEEP_MS || 400);
+/**
+ * 每輪最多補幾天 —— 用來避免一次吃光 FinMind 的當日配額。
+ *
+ * ⚠️ 如果這把 token 和別的服務共用,那個服務隔天早上會抓不到東西,
+ * 而且失敗的樣子是「資料沒更新」,不會有人立刻聯想到是被這裡吃掉的。
+ * **強烈建議替這台申請一把自己的 token** —— 它本來就該有自己的憑證。
+ */
+const BACKFILL_MAX_PER_RUN = Number(process.env.BACKFILL_MAX_PER_RUN || 40);
 let backfilling = false;
 
 async function autoBackfill() {
@@ -381,17 +389,28 @@ async function autoBackfill() {
   try {
     const today = new Date(twDate());
     const todo = [];
-    for (let i = BACKFILL_DAYS; i >= 1; i--) {
+    /*
+     * ⚠️ 由**新往舊**補,不是由舊往新。
+     *
+     * 補到一半撞到配額是常態(三年 ≈ 2,200 次請求,遠超單日上限),所以順序決定了
+     * 中斷時手上是什麼:
+     *   由舊往新 → 早期一塊 + 近期一塊,中間一個洞。5 日/20 日累計會橫跨那個洞,
+     *              算出來的數字看起來正常但是錯的。
+     *   由新往舊 → 永遠是一段「到今天為止的連續區間」,只是比較短。
+     * 短而正確,勝過長而中間破洞 —— 破洞不會有任何徵兆。
+     */
+    for (let i = 1; i <= BACKFILL_DAYS; i++) {
       const d = new Date(today.getTime() - i * 86400_000);
       if (d.getUTCDay() === 0 || d.getUTCDay() === 6) continue; // 週末沒有交易
       todo.push(d.toISOString().slice(0, 10));
     }
     const { rows } = await pool.query(`SELECT day FROM byo_backfill_day`);
     const done = new Set(rows.map((r) => new Date(r.day).toISOString().slice(0, 10)));
-    const pending = todo.filter((d) => !done.has(d));
+    const pending = todo.filter((d) => !done.has(d)).slice(0, BACKFILL_MAX_PER_RUN);
+    const remain = todo.filter((d) => !done.has(d)).length;
     if (pending.length === 0) return;
 
-    log(`歷史回補:待補 ${pending.length} 天(共 ${todo.length} 個交易日)`);
+    log(`歷史回補:本輪 ${pending.length} 天(還剩 ${remain - pending.length} 天;共 ${todo.length} 個交易日)`);
     let n = 0;
     for (const iso of pending) {
       try {
@@ -414,7 +433,7 @@ async function autoBackfill() {
       }
       await new Promise((r) => setTimeout(r, BACKFILL_SLEEP_MS));
     }
-    log(`歷史回補完成:${n} 天`);
+    log(`歷史回補:本輪完成 ${n} 天`);
     await rebuildFeatures(BACKFILL_DAYS);
   } finally {
     backfilling = false;
