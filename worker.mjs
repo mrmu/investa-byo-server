@@ -15,6 +15,7 @@
  */
 import pg from "pg";
 import { collectIntraday } from "./intraday.mjs";
+import { collectIndices } from "./indices.mjs";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
 const FINMIND_TOKEN = process.env.FINMIND_TOKEN || "";
@@ -53,6 +54,11 @@ async function ensureSchema() {
       volume double precision, cum_volume double precision,
       PRIMARY KEY (ticker, date, minute));
     CREATE INDEX IF NOT EXISTS byo_intraday_date ON byo_intraday (date, ticker);
+
+    -- 國際指數與受限總經(Yahoo,E 級;指數限制跟著權利人走)
+    CREATE TABLE IF NOT EXISTS byo_indicator (
+      key text NOT NULL, date date NOT NULL, value double precision,
+      PRIMARY KEY (key, date));
 
     CREATE TABLE IF NOT EXISTS byo_backfill_day (
       day date PRIMARY KEY, rows_written int NOT NULL DEFAULT 0, done_at timestamptz NOT NULL DEFAULT now());
@@ -467,6 +473,16 @@ setInterval(() => autoBackfill().catch((e) => log("歷史回補異常:", e.messa
  * 用 setInterval 而不是對齊整分:MIS 是連續揭示,起點差幾秒不影響那一分鐘的聚合,
  * 而對齊整分要多一層計時邏輯,容器重啟後還會失準。
  */
+/**
+ * 國際指數:每小時一輪。
+ *
+ * 不用「每天一次」:美股收盤在台灣時間清晨,亞股在下午,黃金幾乎全天 ——
+ * 一天一次一定會有某幾檔是隔夜的舊值,而畫面上看不出那是舊的。
+ * 每小時抓 8 檔約 8 次請求,成本可以忽略。
+ */
+collectIndices(pool).catch((e) => log("指數更新異常:", e.message));
+setInterval(() => collectIndices(pool).catch((e) => log("指數更新異常:", e.message)), 3600_000);
+
 let intradayBusy = false;
 setInterval(async () => {
   if (intradayBusy) return; // 一輪要 ~25 秒,重疊會讓兩輪互相覆寫量能差分

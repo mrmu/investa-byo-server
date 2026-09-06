@@ -18,6 +18,7 @@
 import { createServer } from "node:http";
 import pg from "pg";
 import crypto from "node:crypto";
+import { readIndices } from "./indices.mjs";
 
 const PORT = Number(process.env.PORT || 8088);
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
@@ -87,6 +88,7 @@ const CAPABILITIES = [
   { id: "foreign_holding_twse", label: "上市外資持股比例" },
   { id: "securities_lending", label: "個股借券餘額" },
   { id: "intraday_mis", label: "盤中 1 分 K（MIS）" },
+  { id: "indices", label: "國際指數與美元指數（美股／亞股／黃金／DXY）" },
 ];
 
 /** pg 會把 date 欄位轉成 JS Date;String(Date) 會給 "Wed Aug 05" 這種格式,必須明確轉 ISO */
@@ -372,6 +374,9 @@ createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/quote") {
       return json(res, 200, await handleQuote(await readJson(req)), req);
+    }
+    if (req.method === "GET" && url.pathname === "/indices") {
+      return json(res, 200, { indices: await readIndices(pool) }, req);
     }
     if (req.method === "POST" && url.pathname === "/intraday") {
       const out = await handleIntraday(await readJson(req));
