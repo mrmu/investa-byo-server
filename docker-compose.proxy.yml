@@ -1,0 +1,24 @@
+# nginx-proxy（jwilder / nginx-proxy-automation）環境的疊加設定
+#
+#   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d
+#
+# 用途：讓這台取得一個對外網址與 Let's Encrypt 憑證。
+# 沒有這個檔也能跑（見主檔的 ports），但那是明文 http ——
+# app 送的是明文金鑰，正式使用一定要有 TLS。
+#
+# ⚠️ 對外網址**不能填 Investa 的網址**：那是 Investa 的伺服器，
+# 指過去等於「我的自訂資料源就是 Investa 自己」，循環且失去意義。
+services:
+  byo:
+    # 交給 proxy 轉發，不再自己開 port（避免繞過 TLS 直連）
+    ports: !reset []
+    environment:
+      VIRTUAL_HOST: ${BYO_HOST:?請設定 BYO_HOST，例如 byo.example.com}
+      VIRTUAL_PORT: "8088"
+      LETSENCRYPT_HOST: ${BYO_HOST}
+      LETSENCRYPT_EMAIL: ${BYO_EMAIL:?請設定 BYO_EMAIL（Let's Encrypt 通知信箱）}
+    networks: [byo_internal, wp-proxy]
+
+networks:
+  wp-proxy:
+    external: true

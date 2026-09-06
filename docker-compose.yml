@@ -1,0 +1,77 @@
+# 自訂資料源（BYO Server）—— 可獨立部署的完整 stack
+#
+# 這是一台**你自己的**伺服器：它持有沒有開放授權的市場資料，
+# 由你自己運行、自己承擔合規責任。Investa 不持有、不抓取、不轉手這些資料，
+# 你的 app 是直接連到這裡（金鑰也只存在你的裝置上）。
+#
+# ⚠️ `name` 一定要釘死。
+# 沒有它時 compose 用**目錄名**當專案名，volume 就叫 `<目錄名>_byodata`；
+# 換一個目錄部署會建出一個空的新 volume，而舊資料還在磁碟上 ——
+# 看起來像「資料全部不見了」，實際上只是接到了另一個 volume。
+name: byo-server
+
+services:
+  # 獨立的資料庫 —— 這是「完全分離」的關鍵。
+  # BYO server 若讀 Investa 的資料庫，只是換個門進去，不算分離。
+  byodb:
+    image: postgres:16-alpine
+    container_name: investa-byo-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${BYO_DB_PASSWORD:?請先設定 BYO_DB_PASSWORD（見 .env.example）}
+      POSTGRES_DB: byo
+    volumes:
+      - byodata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [byo_internal]
+
+  # 抓取 worker —— 與 server 同一份 image、不同進入點。
+  #
+  # 這是「對等機制」的關鍵：只隔離資料庫而抓取仍在 Investa，
+  # 等於 Investa 仍在取得那些資料，隔離就沒有意義。
+  #
+  # 啟動後會自動補歷史（預設三年，BACKFILL_DAYS 可調）。
+  # 配額用盡會自己停下，等重置後接續 —— 進度記在 DB，重啟不會重來。
+  byoworker:
+    build: .
+    container_name: investa-byo-worker
+    restart: unless-stopped
+    command: ["node", "worker.mjs"]
+    environment:
+      DATABASE_URL: postgresql://postgres:${BYO_DB_PASSWORD}@byodb:5432/byo
+      FINMIND_TOKEN: ${BYO_FINMIND_TOKEN:?請先設定 BYO_FINMIND_TOKEN}
+      BACKFILL_DAYS: ${BACKFILL_DAYS:-1095}
+    depends_on:
+      byodb:
+        condition: service_healthy
+    networks: [byo_internal]
+
+  byo:
+    build: .
+    container_name: investa-byo
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:${BYO_DB_PASSWORD}@byodb:5432/byo
+      PORT: 8088
+      # 預設允許任何來源。安全性靠 X-API-Key **標頭**（瀏覽器不會自動附帶），
+      # 不靠來源限制；要收緊就填逗號分隔的網址。
+      BYO_ALLOWED_ORIGINS: ${BYO_ALLOWED_ORIGINS:-*}
+    ports:
+      # 獨立部署時直接開 port。正式使用請在前面擺一層有 TLS 的反向代理 ——
+      # app 送的是明文金鑰，走 http 等於公開它。
+      - "${BYO_PORT:-8088}:8088"
+    depends_on:
+      byodb:
+        condition: service_healthy
+    networks: [byo_internal]
+
+volumes:
+  byodata:
+
+networks:
+  # 只有 BYO 自己的服務在這個網路上 —— 別人的容器連不進來
+  byo_internal:
