@@ -14,6 +14,7 @@
  * 容器重啟才不會漏掉或重複。
  */
 import pg from "pg";
+import { collectIntraday } from "./intraday.mjs";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
 const FINMIND_TOKEN = process.env.FINMIND_TOKEN || "";
@@ -45,6 +46,14 @@ async function ensureSchema() {
 
     -- 回補進度:一天一列。有「抓過但那天沒資料」這種結果,所以不能用
     -- 「資料表裡有沒有那天」當進度 —— 否則非交易日會被無限重試。
+    -- 盤中 1 分 K（MIS，C 級明確受規範）
+    CREATE TABLE IF NOT EXISTS byo_intraday (
+      ticker text NOT NULL, date date NOT NULL, minute text NOT NULL,
+      open double precision, high double precision, low double precision, close double precision,
+      volume double precision, cum_volume double precision,
+      PRIMARY KEY (ticker, date, minute));
+    CREATE INDEX IF NOT EXISTS byo_intraday_date ON byo_intraday (date, ticker);
+
     CREATE TABLE IF NOT EXISTS byo_backfill_day (
       day date PRIMARY KEY, rows_written int NOT NULL DEFAULT 0, done_at timestamptz NOT NULL DEFAULT now());
   `);
@@ -450,6 +459,26 @@ log("worker started");
 // 啟動就開始補歷史(背景);配額用盡會自己停,每小時再試一次接續
 autoBackfill().catch((e) => log("歷史回補異常:", e.message));
 setInterval(() => autoBackfill().catch((e) => log("歷史回補異常:", e.message)), 3600_000);
+
+/**
+ * 盤中 1 分 K:每分鐘一輪(自己判斷是否在盤中時段)。
+ *
+ * 不與歷史回補搶:一個打 MIS、一個打 FinMind,互不相干。
+ * 用 setInterval 而不是對齊整分:MIS 是連續揭示,起點差幾秒不影響那一分鐘的聚合,
+ * 而對齊整分要多一層計時邏輯,容器重啟後還會失準。
+ */
+let intradayBusy = false;
+setInterval(async () => {
+  if (intradayBusy) return; // 一輪要 ~25 秒,重疊會讓兩輪互相覆寫量能差分
+  intradayBusy = true;
+  try {
+    await collectIntraday(pool);
+  } catch (e) {
+    log("盤中收集異常:", e.message);
+  } finally {
+    intradayBusy = false;
+  }
+}, 60_000);
 setInterval(async () => {
   try {
     const now = new Date(Date.now() + 8 * 3600_000);

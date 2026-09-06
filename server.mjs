@@ -86,6 +86,7 @@ const CAPABILITIES = [
   { id: "institutional_twse", label: "上市三大法人明細" },
   { id: "foreign_holding_twse", label: "上市外資持股比例" },
   { id: "securities_lending", label: "個股借券餘額" },
+  { id: "intraday_mis", label: "盤中 1 分 K（MIS）" },
 ];
 
 /** pg 會把 date 欄位轉成 JS Date;String(Date) 會給 "Wed Aug 05" 這種格式,必須明確轉 ISO */
@@ -314,6 +315,35 @@ async function handleSeries(body) {
   return { ticker, rows: rows.map((r) => ({ ...r, date: ymd(r.date) })), coverage: await coverage() };
 }
 
+/**
+ * 盤中 1 分 K（MIS，C 級明確受規範 —— 這正是它在這台而不是 Investa 的原因）。
+ *
+ * 只回 1 分 K，不做重取樣：呼叫端本來就有重取樣邏輯，
+ * 而在這裡多做一份等於同一件事有兩個實作，遲早對不上。
+ *
+ * 預設回**最近有資料的那一天**，而不是「今天」：
+ * 假日或盤前查詢時，「今天」會回空陣列，而空陣列跟「壞掉」長得一模一樣。
+ * 回最近一個交易日並附上 date，呼叫端才知道自己看的是哪一天。
+ */
+async function handleIntraday(body) {
+  const ticker = String(body?.ticker ?? "").replace(/\.(TW|TWO)$/i, "").trim();
+  if (!ticker) return { error: "缺少 ticker" };
+  const { rows: dr } = await pool.query(
+    body?.date
+      ? `SELECT $2::date AS d`
+      : `SELECT MAX(date) AS d FROM byo_intraday WHERE ticker = $1`,
+    body?.date ? [ticker, body.date] : [ticker],
+  );
+  const day = dr[0]?.d;
+  if (!day) return { ticker, date: null, bars: [] };
+  const { rows } = await pool.query(
+    `SELECT minute, open, high, low, close, volume
+       FROM byo_intraday WHERE ticker = $1 AND date = $2::date ORDER BY minute`,
+    [ticker, day],
+  );
+  return { ticker, date: ymd(day), bars: rows };
+}
+
 createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
 
@@ -342,6 +372,10 @@ createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/quote") {
       return json(res, 200, await handleQuote(await readJson(req)), req);
+    }
+    if (req.method === "POST" && url.pathname === "/intraday") {
+      const out = await handleIntraday(await readJson(req));
+      return json(res, out.error ? 400 : 200, out, req);
     }
     return json(res, 404, { error: "不支援的路徑" }, req);
   } catch (e) {
