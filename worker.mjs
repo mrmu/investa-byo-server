@@ -17,6 +17,7 @@ import pg from "pg";
 import { collectIntraday } from "./intraday.mjs";
 import { collectIndices } from "./indices.mjs";
 import { collectMacro } from "./macro.mjs";
+import { collectIndexHistory } from "./index-history.mjs";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
 const FINMIND_TOKEN = process.env.FINMIND_TOKEN || "";
@@ -60,6 +61,12 @@ async function ensureSchema() {
     CREATE TABLE IF NOT EXISTS byo_indicator (
       key text NOT NULL, date date NOT NULL, value double precision,
       PRIMARY KEY (key, date));
+
+    -- 加權/櫃買指數日 K(證交所/櫃買網站端點,B 級官方非開放)
+    CREATE TABLE IF NOT EXISTS byo_index_history (
+      index_code text NOT NULL, date date NOT NULL,
+      open double precision, high double precision, low double precision, close double precision,
+      PRIMARY KEY (index_code, date));
 
     CREATE TABLE IF NOT EXISTS byo_backfill_day (
       day date PRIMARY KEY, rows_written int NOT NULL DEFAULT 0, done_at timestamptz NOT NULL DEFAULT now());
@@ -490,6 +497,26 @@ setInterval(() => collectIndices(pool).catch((e) => log("指數更新異常:", e
  */
 collectMacro(pool).catch((e) => log("總經更新異常:", e.message));
 setInterval(() => collectMacro(pool).catch((e) => log("總經更新異常:", e.message)), 6 * 3600_000);
+
+/**
+ * 指數日 K 歷史(加權/櫃買)。每輪最多 12 個月份 —— 連打幾十個月會被 rwd 限流,
+ * 而限流回的是空殼不是錯誤,一次補完等於自找靜默失敗。
+ * 每小時一輪,約八小時補完八年,之後每輪只會重抓當月。
+ */
+let idxHistBusy = false;
+const runIndexHistory = async () => {
+  if (idxHistBusy) return;
+  idxHistBusy = true;
+  try {
+    await collectIndexHistory(pool);
+  } catch (e) {
+    log("指數歷史異常:", e.message);
+  } finally {
+    idxHistBusy = false;
+  }
+};
+runIndexHistory();
+setInterval(runIndexHistory, 3600_000);
 
 let intradayBusy = false;
 setInterval(async () => {

@@ -21,6 +21,7 @@ import crypto from "node:crypto";
 import { readIndices } from "./indices.mjs";
 import { readMacro } from "./macro.mjs";
 import { fetchLive } from "./intraday.mjs";
+import { readIndexHistory } from "./index-history.mjs";
 
 const PORT = Number(process.env.PORT || 8088);
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
@@ -93,6 +94,7 @@ const CAPABILITIES = [
   { id: "indices", label: "國際指數與美元指數（美股／亞股／黃金／DXY）" },
   { id: "macro", label: "受限總經（恐懼貪婪／美元台幣／景氣燈號／DXY）" },
   { id: "live_quote", label: "個股即時報價（MIS）" },
+  { id: "index_history", label: "加權／櫃買指數完整日 K" },
 ];
 
 /** pg 會把 date 欄位轉成 JS Date;String(Date) 會給 "Wed Aug 05" 這種格式,必須明確轉 ISO */
@@ -385,6 +387,12 @@ createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/quote") {
       return json(res, 200, await handleQuote(await readJson(req)), req);
+    }
+    if (req.method === "POST" && url.pathname === "/index-candles") {
+      const b = await readJson(req);
+      const code = String(b?.symbol ?? "").toUpperCase();
+      if (!["TAIEX", "TPEX"].includes(code)) return json(res, 400, { error: "symbol 只支援 TAIEX / TPEX" }, req);
+      return json(res, 200, { symbol: code, candles: await readIndexHistory(pool, code, b?.days) }, req);
     }
     if (req.method === "GET" && url.pathname === "/macro") {
       return json(res, 200, { macro: await readMacro(pool) }, req);
