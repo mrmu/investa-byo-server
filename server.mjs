@@ -19,6 +19,8 @@ import { createServer } from "node:http";
 import pg from "pg";
 import crypto from "node:crypto";
 import { readIndices } from "./indices.mjs";
+import { readMacro } from "./macro.mjs";
+import { fetchLive } from "./intraday.mjs";
 
 const PORT = Number(process.env.PORT || 8088);
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
@@ -89,6 +91,8 @@ const CAPABILITIES = [
   { id: "securities_lending", label: "個股借券餘額" },
   { id: "intraday_mis", label: "盤中 1 分 K（MIS）" },
   { id: "indices", label: "國際指數與美元指數（美股／亞股／黃金／DXY）" },
+  { id: "macro", label: "受限總經（恐懼貪婪／美元台幣／景氣燈號／DXY）" },
+  { id: "live_quote", label: "個股即時報價（MIS）" },
 ];
 
 /** pg 會把 date 欄位轉成 JS Date;String(Date) 會給 "Wed Aug 05" 這種格式,必須明確轉 ISO */
@@ -346,6 +350,13 @@ async function handleIntraday(body) {
   return { ticker, date: ymd(day), bars: rows };
 }
 
+/** 個股即時報價(MIS)。查不到回 live:null 而不是錯誤 —— 停牌與代號錯誤都會走到這 */
+async function handleLive(body) {
+  const ticker = String(body?.ticker ?? "").trim();
+  if (!ticker) return { error: "缺少 ticker" };
+  return { live: await fetchLive(ticker) };
+}
+
 createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
 
@@ -374,6 +385,13 @@ createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/quote") {
       return json(res, 200, await handleQuote(await readJson(req)), req);
+    }
+    if (req.method === "GET" && url.pathname === "/macro") {
+      return json(res, 200, { macro: await readMacro(pool) }, req);
+    }
+    if (req.method === "POST" && url.pathname === "/live") {
+      const out = await handleLive(await readJson(req));
+      return json(res, out.error ? 400 : 200, out, req);
     }
     if (req.method === "GET" && url.pathname === "/indices") {
       return json(res, 200, { indices: await readIndices(pool) }, req);

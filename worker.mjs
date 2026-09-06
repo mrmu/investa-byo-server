@@ -16,6 +16,7 @@
 import pg from "pg";
 import { collectIntraday } from "./intraday.mjs";
 import { collectIndices } from "./indices.mjs";
+import { collectMacro } from "./macro.mjs";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
 const FINMIND_TOKEN = process.env.FINMIND_TOKEN || "";
@@ -482,6 +483,13 @@ setInterval(() => autoBackfill().catch((e) => log("歷史回補異常:", e.messa
  */
 collectIndices(pool).catch((e) => log("指數更新異常:", e.message));
 setInterval(() => collectIndices(pool).catch((e) => log("指數更新異常:", e.message)), 3600_000);
+
+/**
+ * 受限總經(FinMind 三項)。每 6 小時 —— 匯率與恐懼貪婪日更、景氣燈號月更,
+ * 不需要更密;而且它與歷史回補共用 FinMind 配額,抓太密會排擠回補。
+ */
+collectMacro(pool).catch((e) => log("總經更新異常:", e.message));
+setInterval(() => collectMacro(pool).catch((e) => log("總經更新異常:", e.message)), 6 * 3600_000);
 
 let intradayBusy = false;
 setInterval(async () => {

@@ -270,3 +270,68 @@ export async function collectIntraday(pool) {
   log(`${date} ${hm} pool=${codes.length} bars=${entries.length} realPct=${realPct}%`);
   return { written: entries.length, realPct };
 }
+
+/**
+ * 單檔即時報價 —— 直接打 MIS，不從落庫的分 K 取。
+ *
+ * 分 K 是每分鐘聚合一次的結果，拿它當「即時」最多會落後一分鐘；
+ * 而使用者盯著頁首報價時，一分鐘的落後看起來就像「不會動」。
+ * 單檔一次請求，成本可以忽略。
+ *
+ * 需要 tse/otc 前綴，所以先查池；池裡沒有就兩種都試一次
+ * （新上市當天可能還不在池裡 —— 這種時候回「查不到」比回錯的市場好，
+ *  但兩種都試的成本只有一次請求，值得）。
+ */
+export async function fetchLive(ticker) {
+  const bare = String(ticker ?? "").replace(/\.(TW|TWO)$/i, "").trim();
+  if (!bare) return null;
+  const codes = poolCache.codes;
+  const known = codes.find((c) => c.endsWith(`_${bare}.tw`));
+  const tries = known ? [known] : [`tse_${bare}.tw`, `otc_${bare}.tw`];
+  for (const ex of tries) {
+    try {
+      const data = await httpGetJson(`${MIS_BASE}?ex_ch=${ex}&json=1&delay=0`, { headers: UA });
+      const m = (data.msgArray ?? [])[0];
+      if (!m) continue;
+      const num = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? n : null;
+      };
+      // 與分 K 同一套價格推導:z 常是 "-",退回五檔並對齊檔位
+      let price = num(m.z) ?? num(m.pz);
+      let real = price != null;
+      if (!real) {
+        const first = (s0) => {
+          for (const seg of String(s0 ?? "").split("_")) {
+            const n = Number(seg);
+            if (Number.isFinite(n) && n > 0) return n;
+          }
+          return null;
+        };
+        const bid = first(m.b);
+        const ask = first(m.a);
+        if (bid && ask) price = alignToTick((bid + ask) / 2, isEtfCode(bare), num(m.y));
+        else price = bid ?? ask ?? null;
+      }
+      if (price == null) continue;
+      const prevClose = num(m.y);
+      return {
+        ticker: bare,
+        price,
+        open: num(m.o),
+        high: num(m.h),
+        low: num(m.l),
+        prevClose,
+        change: prevClose ? Math.round((price - prevClose) * 100) / 100 : null,
+        changePct: prevClose ? Math.round(((price - prevClose) / prevClose) * 10000) / 100 : null,
+        volLots: Number(m.v) || 0,
+        time: m.t ?? null,
+        // 讓呼叫端知道這是真成交價還是推導價 —— 兩者品質不同,不該長得一樣
+        real,
+      };
+    } catch {
+      // 換下一個前綴再試
+    }
+  }
+  return null;
+}
