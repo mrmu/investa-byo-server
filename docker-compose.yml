@@ -45,6 +45,7 @@ services:
       DATABASE_URL: postgresql://postgres:${BYO_DB_PASSWORD}@byodb:5432/byo
       FINMIND_TOKEN: ${BYO_FINMIND_TOKEN:?請先設定 BYO_FINMIND_TOKEN}
       BACKFILL_DAYS: ${BACKFILL_DAYS:-1095}
+      BACKFILL_MAX_PER_RUN: ${BACKFILL_MAX_PER_RUN:-40}
     depends_on:
       byodb:
         condition: service_healthy
