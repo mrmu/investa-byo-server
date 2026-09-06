@@ -24,6 +24,8 @@
  * catch 成 warning，job 每分鐘「正常完成」，整個交易日 40 萬列就這樣沒了。
  */
 
+import { httpGetJson } from "./http-get.mjs";
+
 const MIS_BASE = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp";
 const UA = { "User-Agent": "Mozilla/5.0 (byo-worker)" };
 const BATCH = 80;
@@ -100,9 +102,7 @@ export async function buildPool(twDay) {
     [TPEX_QUOTES, "otc", "SecuritiesCompanyCode"],
   ]) {
     try {
-      const res = await fetch(url, { headers: UA, cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      for (const r of await res.json()) {
+      for (const r of await httpGetJson(url, { headers: UA })) {
         const c = String(r[key] ?? "").trim();
         // 只收 4–6 碼的股票／ETF；權證等不在 MIS 主板也用不到
         if (/^[0-9]{4,6}[A-Z]?$/.test(c)) codes.push(`${prefix}_${c}.tw`);
@@ -131,15 +131,8 @@ async function fetchSnapshots(misCodes, anchorBy) {
   for (let i = 0; i < misCodes.length; i += BATCH) {
     const chunk = misCodes.slice(i, i + BATCH);
     try {
-      const res = await fetch(`${MIS_BASE}?ex_ch=${chunk.join("|")}&json=1&delay=0`, {
-        headers: UA,
-        cache: "no-store",
-      });
-      if (!res.ok) {
-        log(`MIS HTTP ${res.status}（batch ${i / BATCH}）`);
-        continue;
-      }
-      const data = await res.json();
+      // ⚠️ 用 node:https 而不是 fetch —— undici 對 MIS 一律 ECONNRESET（見 http-get.mjs）
+      const data = await httpGetJson(`${MIS_BASE}?ex_ch=${chunk.join("|")}&json=1&delay=0`, { headers: UA });
       for (const r of data.msgArray ?? []) {
         const ok = (v) => Number.isFinite(v) && v > 0;
         // 五檔取「第一個有效價」：鎖死時空側首檔是 "0" 佔位，真價在後
