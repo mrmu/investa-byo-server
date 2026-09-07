@@ -336,20 +336,36 @@ async function handleSeries(body) {
 async function handleIntraday(body) {
   const ticker = String(body?.ticker ?? "").replace(/\.(TW|TWO)$/i, "").trim();
   if (!ticker) return { error: "缺少 ticker" };
+
+  /*
+   * 回**最近 N 個交易日**，不是只有一天。
+   *
+   * 只回一天的話，60 分週期一整個交易日只有約 4.5 根 —— 呼叫端若要求
+   * 「至少 10 根才算就緒」就永遠到不了，畫面會一直停在「資料收集中」，
+   * 而且看起來像收集失敗，實際上是視窗太短（2026-09-07 開盤實測）。
+   *
+   * 每一根都帶自己的日期：跨日的桶必須分開，否則不同天的同一時刻會疊在一起。
+   */
+  const days = Math.min(Math.max(Number(body?.days) || 10, 1), 30);
   const { rows: dr } = await pool.query(
     body?.date
       ? `SELECT $2::date AS d`
-      : `SELECT MAX(date) AS d FROM byo_intraday WHERE ticker = $1`,
+      : `SELECT DISTINCT date AS d FROM byo_intraday WHERE ticker = $1 ORDER BY d DESC LIMIT ${days}`,
     body?.date ? [ticker, body.date] : [ticker],
   );
-  const day = dr[0]?.d;
-  if (!day) return { ticker, date: null, bars: [] };
+  if (dr.length === 0) return { ticker, date: null, bars: [] };
+  const dates = dr.map((r) => r.d);
   const { rows } = await pool.query(
-    `SELECT minute, open, high, low, close, volume
-       FROM byo_intraday WHERE ticker = $1 AND date = $2::date ORDER BY minute`,
-    [ticker, day],
+    `SELECT date, minute, open, high, low, close, volume
+       FROM byo_intraday WHERE ticker = $1 AND date = ANY($2::date[])
+      ORDER BY date, minute`,
+    [ticker, dates],
   );
-  return { ticker, date: ymd(day), bars: rows };
+  return {
+    ticker,
+    date: ymd(dates[0]), // 最新交易日
+    bars: rows.map((r) => ({ ...r, date: ymd(r.date) })),
+  };
 }
 
 /** 個股即時報價(MIS)。查不到回 live:null 而不是錯誤 —— 停牌與代號錯誤都會走到這 */
