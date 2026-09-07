@@ -282,17 +282,33 @@ export async function collectIntraday(pool) {
  * （新上市當天可能還不在池裡 —— 這種時候回「查不到」比回錯的市場好，
  *  但兩種都試的成本只有一次請求，值得）。
  */
+/**
+ * 指數的 MIS 代碼。個股是 tse_2330.tw,指數另有專屬代碼 ——
+ * 用個股的規則拼不出來,而拼錯的結果是「查不到」而不是報錯。
+ */
+const INDEX_MIS = { TAIEX: "tse_t00.tw", TPEX: "otc_o00.tw" };
+
 export async function fetchLive(ticker) {
+  const raw = String(ticker ?? "").trim().toUpperCase();
+  if (INDEX_MIS[raw]) return fetchQuote(INDEX_MIS[raw], raw, false);
   const bare = String(ticker ?? "").replace(/\.(TW|TWO)$/i, "").trim();
   if (!bare) return null;
   const codes = poolCache.codes;
   const known = codes.find((c) => c.endsWith(`_${bare}.tw`));
   const tries = known ? [known] : [`tse_${bare}.tw`, `otc_${bare}.tw`];
   for (const ex of tries) {
+    const q = await fetchQuote(ex, bare, isEtfCode(bare));
+    if (q) return q;
+  }
+  return null;
+}
+
+async function fetchQuote(ex, label, isEtf) {
+  {
     try {
       const data = await httpGetJson(`${MIS_BASE}?ex_ch=${ex}&json=1&delay=0`, { headers: UA });
       const m = (data.msgArray ?? [])[0];
-      if (!m) continue;
+      if (!m) return null;
       const num = (v) => {
         const n = Number(v);
         return Number.isFinite(n) && n > 0 ? n : null;
@@ -310,10 +326,10 @@ export async function fetchLive(ticker) {
         };
         const bid = first(m.b);
         const ask = first(m.a);
-        if (bid && ask) price = alignToTick((bid + ask) / 2, isEtfCode(bare), num(m.y));
+        if (bid && ask) price = alignToTick((bid + ask) / 2, isEtf, num(m.y));
         else price = bid ?? ask ?? null;
       }
-      if (price == null) continue;
+      if (price == null) return null;
       const prevClose = num(m.y);
       /*
        * `date` 是必要欄位,不是附帶資訊。
@@ -327,7 +343,7 @@ export async function fetchLive(ticker) {
         ? `${d8.slice(0, 4)}-${d8.slice(4, 6)}-${d8.slice(6, 8)}`
         : new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10);
       return {
-        ticker: bare,
+        ticker: label,
         date,
         price,
         open: num(m.o),
@@ -342,7 +358,7 @@ export async function fetchLive(ticker) {
         real,
       };
     } catch {
-      // 換下一個前綴再試
+      return null;
     }
   }
   return null;

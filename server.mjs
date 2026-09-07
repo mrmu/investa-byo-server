@@ -408,7 +408,24 @@ createServer(async (req, res) => {
       const b = await readJson(req);
       const code = String(b?.symbol ?? "").toUpperCase();
       if (!["TAIEX", "TPEX"].includes(code)) return json(res, 400, { error: "symbol 只支援 TAIEX / TPEX" }, req);
-      return json(res, 200, { symbol: code, candles: await readIndexHistory(pool, code, b?.days) }, req);
+      /*
+       * 附上今日即時棒:日 K 歷史最快也要收盤後才有當天,
+       * 而使用者盤中點進指數頁看到的就是「停在昨天」——
+       * 那看起來像資料沒更新,實際上是還沒收盤。
+       */
+      const candles = await readIndexHistory(pool, code, b?.days);
+      const live = await fetchLive(code);
+      if (live && candles.length > 0 && live.date > candles[candles.length - 1].t) {
+        candles.push({
+          t: live.date,
+          o: live.open ?? live.price,
+          h: live.high ?? live.price,
+          l: live.low ?? live.price,
+          c: live.price,
+          v: 0, // 指數的即時報價不含成交金額
+        });
+      }
+      return json(res, 200, { symbol: code, candles, live }, req);
     }
     if (req.method === "GET" && url.pathname === "/macro") {
       return json(res, 200, { macro: await readMacro(pool) }, req);
