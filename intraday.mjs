@@ -315,8 +315,20 @@ export async function fetchLive(ticker) {
       }
       if (price == null) continue;
       const prevClose = num(m.y);
+      /*
+       * `date` 是必要欄位,不是附帶資訊。
+       * 呼叫端用它判斷「這筆報價是不是今天的」以及要不要疊到日 K 的最後一根上;
+       * 少了它,那些判斷會靜默走進 fallback —— 畫面看起來只是「沒有即時更新」,
+       * 完全看不出是缺一個欄位(2026-09-07 開盤實測)。
+       * MIS 的 d 是西元 yyyymmdd;沒有就用台北日期補。
+       */
+      const d8 = String(m.d ?? "").trim();
+      const date = /^\d{8}$/.test(d8)
+        ? `${d8.slice(0, 4)}-${d8.slice(4, 6)}-${d8.slice(6, 8)}`
+        : new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10);
       return {
         ticker: bare,
+        date,
         price,
         open: num(m.o),
         high: num(m.h),
