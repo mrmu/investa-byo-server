@@ -32,6 +32,19 @@ const BATCH = 80;
 const SAMPLES = 2; // 每分鐘取樣次數
 const SAMPLE_GAP_MS = 12_000;
 const BATCH_GAP_MS = 500;
+/**
+ * 同時送幾批。
+ *
+ * 2026-09-07 首日實測:30 批逐批序列送,一輪要 3.3 分鐘,
+ * 所以整個交易日只收到 82 根而不是 270 根 —— 標籤寫著「1 分 K」
+ * 但實際是 3.3 分 K,而且分鐘標籤不連續。
+ * 每輪之間有 intradayBusy 擋著,所以慢的代價不是重疊而是**跳過**。
+ *
+ * 5 是保守值:MIS 沒有公布速率限制,而超過會回空殼不會回錯誤
+ *(那正是最難察覺的失敗)。realPct 與 bars 兩個指標會反映惡化,
+ * 明天看過再決定要不要再往上調。
+ */
+const BATCH_CONCURRENCY = 5;
 const EMPTY_ALERT_ROUNDS = 5;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -128,50 +141,71 @@ let emptyRounds = 0;
 
 async function fetchSnapshots(misCodes, anchorBy) {
   const out = [];
-  for (let i = 0; i < misCodes.length; i += BATCH) {
-    const chunk = misCodes.slice(i, i + BATCH);
-    try {
-      // ⚠️ 用 node:https 而不是 fetch —— undici 對 MIS 一律 ECONNRESET（見 http-get.mjs）
-      const data = await httpGetJson(`${MIS_BASE}?ex_ch=${chunk.join("|")}&json=1&delay=0`, { headers: UA });
-      for (const r of data.msgArray ?? []) {
-        const ok = (v) => Number.isFinite(v) && v > 0;
-        // 五檔取「第一個有效價」：鎖死時空側首檔是 "0" 佔位，真價在後
-        const firstValid = (s0) => {
-          for (const seg of String(s0 ?? "").split("_")) {
-            const n = Number(seg);
-            if (ok(n)) return n;
-          }
-          return NaN;
-        };
-        let price = Number(r.z);
-        if (!ok(price)) price = Number(r.pz);
-        let real = ok(price);
-        if (real) {
-          lastReal.set(r.c, price);
-        } else {
-          const bid = firstValid(r.b);
-          const ask = firstValid(r.a);
-          const lr = lastReal.get(r.c);
-          if (ok(bid) && ok(ask) && lr != null && lr >= bid && lr <= ask) {
-            price = lr; // 五檔尚未越過最後成交價 → 它仍然有效
-            real = true;
-          } else if (ok(bid) && ok(ask)) {
-            const anchor = anchorBy.get(r.c) ?? (ok(Number(r.y)) ? Number(r.y) : null);
-            price = alignToTick((bid + ask) / 2, isEtfCode(r.c), anchor);
-          } else if (ok(bid)) price = bid;
-          else if (ok(ask)) price = ask;
-          else price = NaN;
-        }
-        const cumLots = Number(r.v); // 當日累計成交量（張）
-        if (!r.c || !ok(price) || !Number.isFinite(cumLots)) continue;
-        out.push({ ticker: r.c, price, cumLots, real });
-      }
-    } catch (e) {
-      log("MIS batch error:", e.message);
-    }
-    if (i + BATCH < misCodes.length) await sleep(BATCH_GAP_MS);
+  const chunks = [];
+  for (let i = 0; i < misCodes.length; i += BATCH) chunks.push(misCodes.slice(i, i + BATCH));
+
+  // 分波並行:每波 BATCH_CONCURRENCY 批,波與波之間仍留間隔
+  for (let w = 0; w < chunks.length; w += BATCH_CONCURRENCY) {
+    const wave = chunks.slice(w, w + BATCH_CONCURRENCY);
+    const results = await Promise.all(wave.map((c) => fetchBatch(c)));
+    for (const rows of results) out.push(...rows.map((r) => toSnap(r, anchorBy)).filter(Boolean));
+    if (w + BATCH_CONCURRENCY < chunks.length) await sleep(BATCH_GAP_MS);
   }
   return out;
+}
+
+async function fetchBatch(chunk) {
+  try {
+    // ⚠️ 用 node:https 而不是 fetch —— undici 對 MIS 一律 ECONNRESET（見 http-get.mjs）
+    const data = await httpGetJson(`${MIS_BASE}?ex_ch=${chunk.join("|")}&json=1&delay=0`, { headers: UA });
+    return data.msgArray ?? [];
+  } catch (e) {
+    log("MIS batch error:", e.message);
+    return [];
+  }
+}
+
+/**
+ * 一筆 MIS 快照 → 一筆價格。取不到有效價回 null。
+ *
+ * 價格 fallback 鏈:z(最新成交價,實測常為 "-")→ pz → 最後成交價(仍在價差內時)
+ * → 買賣一中價(對齊檔位)→ 單邊五檔。每往下一層,價格的可信度就低一級,
+ * 所以回傳帶 `real` 讓上層統計 realPct —— 那是盤中價品質唯一的監控指標。
+ */
+function toSnap(r, anchorBy) {
+  const ok = (v) => Number.isFinite(v) && v > 0;
+  // 五檔取「第一個有效價」:鎖死時空側首檔是 "0" 佔位,真價在後
+  const firstValid = (s0) => {
+    for (const seg of String(s0 ?? "").split("_")) {
+      const n = Number(seg);
+      if (ok(n)) return n;
+    }
+    return null;
+  };
+
+  let price = Number(r.z);
+  if (!ok(price)) price = Number(r.pz);
+  let real = ok(price);
+  if (real) {
+    lastReal.set(r.c, price);
+  } else {
+    const bid = firstValid(r.b);
+    const ask = firstValid(r.a);
+    const lr = lastReal.get(r.c);
+    if (ok(bid) && ok(ask) && lr != null && lr >= bid && lr <= ask) {
+      price = lr; // 五檔尚未越過最後成交價 → 它仍然有效
+      real = true;
+    } else if (ok(bid) && ok(ask)) {
+      const anchor = anchorBy.get(r.c) ?? (ok(Number(r.y)) ? Number(r.y) : null);
+      price = alignToTick((bid + ask) / 2, isEtfCode(r.c), anchor);
+    } else if (ok(bid)) price = bid;
+    else if (ok(ask)) price = ask;
+    else price = NaN;
+  }
+
+  const cumLots = Number(r.v); // 當日累計成交量(張)
+  if (!r.c || !ok(price) || !Number.isFinite(cumLots)) return null;
+  return { ticker: r.c, price, cumLots, real };
 }
 
 // ─── 每分鐘一輪 ────────────────────────────────────────────────
