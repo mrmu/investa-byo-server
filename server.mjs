@@ -17,6 +17,7 @@
  */
 import { createServer } from "node:http";
 import pg from "pg";
+import { ensureIndustrySchema } from "./industry.mjs";
 import crypto from "node:crypto";
 import { readIndices } from "./indices.mjs";
 import { readMacro } from "./macro.mjs";
@@ -95,6 +96,7 @@ const CAPABILITIES = [
   { id: "macro", label: "受限總經（恐懼貪婪／美元台幣／景氣燈號／DXY）" },
   { id: "live_quote", label: "個股即時報價（MIS）" },
   { id: "index_history", label: "加權／櫃買指數完整日 K" },
+  { id: "industry_taxonomy", label: "產業細分類" },
 ];
 
 /** pg 會把 date 欄位轉成 JS Date;String(Date) 會給 "Wed Aug 05" 這種格式,必須明確轉 ISO */
@@ -232,6 +234,28 @@ async function handleQuote(body) {
     [tickers],
   );
   return { rows: rows.map((r) => ({ ...r, date: ymd(r.date) })) };
+}
+
+/**
+ * 產業細分類 —— 整份回傳(約 2 千檔,幾十 KB)。
+ *
+ * 不做 tickers 過濾:呼叫端要的是「畫面上這一批的產業」,而畫面一直在換;
+ * 整份給它快取一次,比每頁一次往返省。附 updatedAt 讓呼叫端自己決定要不要重取。
+ */
+async function handleIndustry() {
+  // worker 還沒跑過時表可能不存在 —— 建好空表回空集合,不要 500
+  await ensureIndustrySchema(pool);
+  const { rows } = await pool.query(
+    `SELECT ticker, label, updated_at FROM byo_industry WHERE label <> ''`,
+  );
+  const industries = {};
+  let updatedAt = null;
+  for (const r of rows) {
+    industries[r.ticker] = r.label;
+    const t = r.updated_at instanceof Date ? r.updated_at.toISOString() : String(r.updated_at);
+    if (!updatedAt || t > updatedAt) updatedAt = t;
+  }
+  return { industries, count: rows.length, updatedAt };
 }
 
 // CLI:產生金鑰。明文只在此輸出一次。
@@ -403,6 +427,9 @@ createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/quote") {
       return json(res, 200, await handleQuote(await readJson(req)), req);
+    }
+    if (req.method === "GET" && url.pathname === "/industry") {
+      return json(res, 200, await handleIndustry(), req);
     }
     if (req.method === "POST" && url.pathname === "/index-candles") {
       const b = await readJson(req);

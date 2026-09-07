@@ -18,6 +18,7 @@ import { collectIntraday } from "./intraday.mjs";
 import { collectIndices } from "./indices.mjs";
 import { collectMacro } from "./macro.mjs";
 import { collectIndexHistory } from "./index-history.mjs";
+import { ensureIndustrySchema, refreshIndustry } from "./industry.mjs";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
 const FINMIND_TOKEN = process.env.FINMIND_TOKEN || "";
@@ -471,8 +472,37 @@ const RUN_HOURS_TW = [17, 19, 21]; // 盤後陸續公布，跑三輪補齊
 log("worker started");
 
 // 啟動就開始補歷史(背景);配額用盡會自己停,每小時再試一次接續
+/**
+ * 產業細分類:每月重抓一次。
+ *
+ * 判斷用「資料多舊」而不是計時器 —— 容器重啟後計時器歸零,
+ * 用 updated_at 比對才不會每次重啟都重抓一輪(對來源不禮貌,也沒必要)。
+ * 分類體系一個月變不了幾個字,25 天是刻意留的鬆度。
+ */
+const INDUSTRY_MAX_AGE_DAYS = 25;
+let refreshingIndustry = false;
+async function autoRefreshIndustry() {
+  if (refreshingIndustry) return;
+  refreshingIndustry = true;
+  try {
+    await ensureIndustrySchema(pool);
+    const { rows } = await pool.query(`SELECT MAX(updated_at) AS at FROM byo_industry`);
+    const at = rows[0]?.at ? new Date(rows[0].at).getTime() : 0;
+    const ageDays = (Date.now() - at) / 86400_000;
+    if (at && ageDays < INDUSTRY_MAX_AGE_DAYS) return;
+    log(`產業細分類:資料 ${at ? `已 ${Math.round(ageDays)} 天` : "尚未建立"},開始重抓`);
+    await refreshIndustry(pool, { log });
+  } catch (e) {
+    log("產業細分類重抓失敗(保留舊資料):", e.message);
+  } finally {
+    refreshingIndustry = false;
+  }
+}
+
 autoBackfill().catch((e) => log("歷史回補異常:", e.message));
 setInterval(() => autoBackfill().catch((e) => log("歷史回補異常:", e.message)), 3600_000);
+autoRefreshIndustry();
+setInterval(autoRefreshIndustry, 12 * 3600_000);
 
 /**
  * 盤中 1 分 K:每分鐘一輪(自己判斷是否在盤中時段)。
