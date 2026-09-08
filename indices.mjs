@@ -24,15 +24,30 @@ const log = (...a) => console.log(`[byo-indices ${new Date().toISOString().slice
  * 對照表與 Investa 的 `INDEX_GROUPS` 一致 —— 兩邊的 key 必須對得起來，
  * 否則 app 拿到資料卻對不上分組，畫面仍然是空的（而且看起來像沒抓到）。
  */
+/*
+ * `closeUtc` = 該市場當日的**收盤時刻**（UTC 小時，可含小數）。
+ *
+ * 為什麼需要（2026-09-09）：`byo_indicator.date` 是 DATE，直接 toISOString()
+ * 會得到當天的**午夜 UTC**，在台北顯示成「早上 8 點」——於是 09-08 收盤的美股
+ * 在 app 上看起來是「09-08 早上更新」，比實際**舊了 13 小時**，使用者讀成「停更了」。
+ *
+ * 這是 Investa 那邊 taifexNightQuote() 踩過的同一個坑的鏡像：那邊填午夜讓資料
+ * 看起來**比較新**，這邊讓資料看起來**比較舊**。兩邊的教訓一樣——
+ * 這一欄是使用者判斷「資料多舊」的唯一依據，填錯就等於謊報。
+ *
+ * 時刻取常態收盤（不處理夏令時間與半日市，誤差 1 小時內，對「多舊」的判斷夠用）：
+ *   美股 16:00 ET ≈ 20:00 UTC（夏令）｜日經 15:00 JST = 06:00 UTC
+ *   KOSPI 15:30 KST = 06:30 UTC｜黃金與美元指數是連續盤，取美股收盤對齊
+ */
 export const SERIES = [
-  { key: "DJI", symbol: "^DJI", name: "道瓊工業", group: "美股" },
-  { key: "SPX", symbol: "^GSPC", name: "S&P 500", group: "美股" },
-  { key: "IXIC", symbol: "^IXIC", name: "NASDAQ", group: "美股" },
-  { key: "SOX", symbol: "^SOX", name: "費城半導體", group: "美股" },
-  { key: "N225", symbol: "^N225", name: "日經 225", group: "亞股" },
-  { key: "KOSPI", symbol: "^KS11", name: "韓國綜合", group: "亞股" },
-  { key: "GOLD", symbol: "GC=F", name: "黃金", group: "原物料" },
-  { key: "DXY", symbol: "DX-Y.NYB", name: "美元指數", group: "總經" },
+  { key: "DJI", symbol: "^DJI", name: "道瓊工業", group: "美股", closeUtc: 20 },
+  { key: "SPX", symbol: "^GSPC", name: "S&P 500", group: "美股", closeUtc: 20 },
+  { key: "IXIC", symbol: "^IXIC", name: "NASDAQ", group: "美股", closeUtc: 20 },
+  { key: "SOX", symbol: "^SOX", name: "費城半導體", group: "美股", closeUtc: 20 },
+  { key: "N225", symbol: "^N225", name: "日經 225", group: "亞股", closeUtc: 6 },
+  { key: "KOSPI", symbol: "^KS11", name: "韓國綜合", group: "亞股", closeUtc: 6.5 },
+  { key: "GOLD", symbol: "GC=F", name: "黃金", group: "原物料", closeUtc: 20 },
+  { key: "DXY", symbol: "DX-Y.NYB", name: "美元指數", group: "總經", closeUtc: 20 },
 ];
 
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -90,6 +105,12 @@ export async function collectIndices(pool) {
  * 供顯示層取用：回「最新值 + 漲跌 + 走勢」，形狀對齊 Investa 的 index 物件，
  * app 端拿到就能直接填進原本的分組，不必再做一次轉換。
  */
+/** 交易日 + 收盤時刻 → ISO 時間戳（見 SERIES.closeUtc 的註解） */
+function closeAt(date, closeUtc = 0) {
+  const d = new Date(date);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) + closeUtc * 3600_000).toISOString();
+}
+
 export async function readIndices(pool, sparkN = 30) {
   const { rows } = await pool.query(
     `SELECT key, date, value FROM byo_indicator
@@ -116,8 +137,12 @@ export async function readIndices(pool, sparkN = 30) {
         price: round2(price),
         change: round2(change),
         changePct: round2((change / prevClose) * 100),
-        // 用資料本身的日期，不用 now() —— 前者看得出「停更了幾天」，後者永遠新鮮
-        updatedAt: new Date(days[days.length - 1][0]).toISOString(),
+        /*
+         * 用資料本身的日期，不用 now() —— 前者看得出「停更了幾天」，後者永遠新鮮。
+         * 但要加上該市場的**收盤時刻**，不能停在午夜：DATE 直接轉 ISO 會變成
+         * 00:00 UTC（台北早上 8 點），讓美股收盤看起來比實際舊 13 小時。
+         */
+        updatedAt: closeAt(days[days.length - 1][0], s.closeUtc),
       },
       sparkline: days.slice(-sparkN).map(([, v]) => round2(v)),
     });
