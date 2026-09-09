@@ -1,2 +1,8 @@
 .env
 node_modules/
+
+# 這台主機的部署設定（VIRTUAL_HOST / wp-proxy 網路）—— 每台機器不同，不進版控。
+# ⚠️ 但它是**必要的**：少了它容器會被重建成沒有 VIRTUAL_HOST，
+# nginx-proxy 會把 vhost 整段拿掉（2026-09-07 的教訓，見該檔開頭與 deploy.sh）。
+# 忽略它是為了不讓它被誤 commit，不是因為它可有可無 —— deploy.sh 會檢查它存在。
+docker-compose.override.yml
