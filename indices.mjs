@@ -47,6 +47,19 @@ export const SERIES = [
   { key: "N225", symbol: "^N225", name: "日經 225", group: "亞股", closeUtc: 6 },
   { key: "KOSPI", symbol: "^KS11", name: "韓國綜合", group: "亞股", closeUtc: 6.5 },
   { key: "GOLD", symbol: "GC=F", name: "黃金", group: "原物料", closeUtc: 20 },
+  /*
+   * 布蘭特原油 —— **不是授權問題,是時效問題**(2026-09-10 加)。
+   *
+   * Investa 那邊走 FRED `DCOILBRENTEU`(EIA 現貨,授權乾淨),但那條序列
+   * 本身就延遲約 9 天(實測 09-10 當天最新只到 09-01)。要當日價只能取期貨報價,
+   * 而那是 E 級(ToS 灰色)—— 正是自訂資料源存在的理由。
+   *
+   * ⚠️ 跟其他項目不同:Investa **仍然會供應** FRED 版的布蘭特給所有人,
+   * 這裡是**覆蓋**不是**填補**。沒接自訂資料源的人看得到(慢 9 天),
+   * 接了的人看到當日價。不要把它加進 Investa 的 BYO_DB_SERIES ——
+   * 那會讓沒接的人反而看不到本來看得到的乾淨資料。
+   */
+  { key: "BRENT", symbol: "BZ=F", name: "布蘭特原油", group: "原物料", closeUtc: 20 },
   { key: "DXY", symbol: "DX-Y.NYB", name: "美元指數", group: "總經", closeUtc: 20 },
 ];
 
