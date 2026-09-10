@@ -20,6 +20,7 @@ import pg from "pg";
 import { ensureIndustrySchema } from "./industry.mjs";
 import crypto from "node:crypto";
 import { readIndices } from "./indices.mjs";
+import { readNightFutures } from "./futures.mjs";
 import { readMacro } from "./macro.mjs";
 import { fetchLive } from "./intraday.mjs";
 import { readIndexHistory } from "./index-history.mjs";
@@ -93,6 +94,7 @@ const CAPABILITIES = [
   { id: "securities_lending", label: "個股借券餘額" },
   { id: "intraday_mis", label: "盤中 1 分 K（MIS）" },
   { id: "indices", label: "國際指數與美元指數（美股／亞股／黃金／DXY）" },
+  { id: "futures", label: "台指期夜盤" },
   { id: "macro", label: "受限總經（恐懼貪婪／美元台幣／景氣燈號／DXY）" },
   { id: "live_quote", label: "個股即時報價（MIS）" },
   { id: "index_history", label: "加權／櫃買指數完整日 K" },
@@ -462,7 +464,7 @@ createServer(async (req, res) => {
       return json(res, out.error ? 400 : 200, out, req);
     }
     if (req.method === "GET" && url.pathname === "/indices") {
-      return json(res, 200, { indices: await readIndices(pool) }, req);
+      return json(res, 200, { indices: [...(await readIndices(pool)), ...(await readNightFutures(pool))] }, req);
     }
     if (req.method === "POST" && url.pathname === "/intraday") {
       const out = await handleIntraday(await readJson(req));

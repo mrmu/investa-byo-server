@@ -18,6 +18,7 @@ import { collectIntraday } from "./intraday.mjs";
 import { collectIndices } from "./indices.mjs";
 import { collectMacro } from "./macro.mjs";
 import { collectIndexHistory } from "./index-history.mjs";
+import { collectNightFutures } from "./futures.mjs";
 import { ensureIndustrySchema, refreshIndustry } from "./industry.mjs";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
@@ -62,6 +63,13 @@ async function ensureSchema() {
     CREATE TABLE IF NOT EXISTS byo_indicator (
       key text NOT NULL, date date NOT NULL, value double precision,
       PRIMARY KEY (key, date));
+
+    -- 台指期夜盤收盤快照(期交所 MIS;漲跌是 MIS 口徑,vs 前日盤參考價,
+    -- 不能從 byo_indicator 的前一夜收盤重算,見 futures.mjs 檔頭)
+    CREATE TABLE IF NOT EXISTS byo_futures_quote (
+      key text PRIMARY KEY, price double precision, change double precision,
+      change_pct double precision, quote_at timestamptz,
+      fetched_at timestamptz NOT NULL DEFAULT now());
 
     -- 加權/櫃買指數日 K(證交所/櫃買網站端點,B 級官方非開放)
     CREATE TABLE IF NOT EXISTS byo_index_history (
@@ -338,6 +346,12 @@ if (process.argv[2] === "--once") {
   await pool.end();
   process.exit(0);
 }
+// 手動抓一次夜盤快照(部署驗證用;不受 06:00–14:59 窗口限制 —— 夜盤時段抓到的是盤中價)
+if (process.argv[2] === "--night") {
+  await collectNightFutures(pool);
+  await pool.end();
+  process.exit(0);
+}
 /**
  * 回補一段期間。
  *
@@ -527,6 +541,29 @@ setInterval(() => collectIndices(pool).catch((e) => log("指數更新異常:", e
  */
 collectMacro(pool).catch((e) => log("總經更新異常:", e.message));
 setInterval(() => collectMacro(pool).catch((e) => log("總經更新異常:", e.message)), 6 * 3600_000);
+
+/**
+ * 台指期夜盤:每天 06:00 後第一個 tick 抓一次收盤快照,當天跑過就不再跑。
+ * 不綁定固定分鐘 —— 容器剛好在那一分鐘外重啟就會漏掉一整天。
+ * 窗口限 06:00–14:59:15:00 起新夜盤開始交易,再抓會把「昨夜收盤」蓋成盤中價。
+ */
+setInterval(async () => {
+  try {
+    const twH = new Date(Date.now() + 8 * 3600_000).getUTCHours();
+    if (twH < 6 || twH >= 15) return;
+    const { rows } = await pool.query(`SELECT last_date FROM byo_job_run WHERE job = 'night_futures'`);
+    const last = rows[0]?.last_date ? new Date(rows[0].last_date).toISOString().slice(0, 10) : null;
+    if (last === twDate()) return;
+    await collectNightFutures(pool);
+    await pool.query(
+      `INSERT INTO byo_job_run (job, last_date, last_ok_at, last_error) VALUES ('night_futures', $1, now(), NULL)
+       ON CONFLICT (job) DO UPDATE SET last_date = EXCLUDED.last_date, last_ok_at = now(), last_error = NULL`,
+      [twDate()],
+    );
+  } catch (e) {
+    log("夜盤快照失敗:", e.message);
+  }
+}, 60_000);
 
 /**
  * 指數日 K 歷史(加權/櫃買)。每輪最多 12 個月份 —— 連打幾十個月會被 rwd 限流,
