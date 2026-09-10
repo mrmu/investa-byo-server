@@ -57,7 +57,7 @@ async function fetchMisNight() {
 /** 每天一次:寫收盤快照(漲跌用 MIS 口徑)+ 累積日收盤(sparkline 用) */
 export async function collectNightFutures(pool) {
   const q = await fetchMisNight();
-  const d = String(q.CDate); // yyyymmdd,夜盤標記為「次一交易日」
+  const d = String(q.CDate); // yyyymmdd —— 最後成交的**日曆日**(實測 9/10 夜間回 20260910),不是期交所開放資料那套「標記次一交易日」
   const date = `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
   // CDate/CTime 是最後成交的台北時間;收盤後抓到的就是收盤那筆
   const t = String(q.CTime || "050000").padStart(6, "0");
