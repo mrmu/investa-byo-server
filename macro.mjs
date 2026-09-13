@@ -146,11 +146,32 @@ export async function readMacro(pool) {
     const asOf = new Date(r.date).toISOString().slice(0, 10);
     const lagDays = (Date.now() - new Date(r.date).getTime()) / 86400_000;
     const v = Math.abs(value) >= 100 ? value.toFixed(1) : value.toFixed(2).replace(/\.?0+$/, "");
+    /*
+     * trend 與 signal 是給**裝置端算總經風險分**用的（2026-09-13）。
+     *
+     * 原本只回 `status`（顯示用的 danger/watch/ok）與格式化過的 value 字串。
+     * 那對「顯示一顆燈」夠用，但 Investa 的加權計分還要 trend（壞指標惡化 +1、
+     * 紅燈開始修正 -1），而那四項受限指標的活值只有這台有 —— 伺服器算出來的
+     * 分數因此一直帶著停更的輸入。把 signal/trend 一起送出去，裝置就能重算。
+     *
+     * ⚠️ 仍然**不回原始數值以外的解讀**：燈號判定留在這裡（門檻與 Investa 對齊），
+     * 裝置只是把兩邊的 signal 合併計分，不重新判斷門檻 —— 不要讓門檻出現第三份。
+     */
+    const trend =
+      prev == null || prev === 0
+        ? "FLAT"
+        : (value - prev) / Math.abs(prev) > 0.02
+          ? "UP"
+          : (value - prev) / Math.abs(prev) < -0.02
+            ? "DOWN"
+            : "FLAT";
     out.push({
       key: r.key.toLowerCase(),
       name: cfg.label,
       value: cfg.unit === "%" ? `${v}%` : `${v}${cfg.unit ? ` ${cfg.unit}` : ""}`,
       status: sig === "RED" ? "danger" : sig === "YELLOW" ? "watch" : "ok",
+      signal: sig,
+      trend,
       asOf,
       freq: cfg.freq,
       // stale = 超過該序列的合理發布延遲 → 這才是「排程可能掛了」的訊號，
