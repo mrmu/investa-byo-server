@@ -22,7 +22,7 @@ import crypto from "node:crypto";
 import { readIndices } from "./indices.mjs";
 import { readNightFutures } from "./futures.mjs";
 import { readMacro } from "./macro.mjs";
-import { fetchLive } from "./intraday.mjs";
+import { fetchLive, fetchLiveMany } from "./intraday.mjs";
 import { readIndexHistory } from "./index-history.mjs";
 
 const PORT = Number(process.env.PORT || 8088);
@@ -395,9 +395,24 @@ async function handleIntraday(body) {
 }
 
 /** 個股即時報價(MIS)。查不到回 live:null 而不是錯誤 —— 停牌與代號錯誤都會走到這 */
+/**
+ * POST /live
+ *   單檔：{ ticker: "2330" }        → { live: {...} | null }
+ *   批次：{ tickers: ["2330","2317"] } → { live: [...] }
+ *
+ * 批次是為了清單頁（自選股、選股結果）——逐檔打是十幾二十個來回，
+ * 行動網路上慢到不能用。MIS 的 ex_ch 支援 `|` 串接，所以 20 檔＝一個請求。
+ *
+ * 兩種形狀共存而不是改掉單檔：個股頁每 5 秒輪詢一檔，用陣列包一個元素
+ * 只是讓呼叫端多一層解包。舊版 app 也還在打單檔版。
+ */
 async function handleLive(body) {
+  if (Array.isArray(body?.tickers)) {
+    if (body.tickers.length === 0) return { error: "tickers 是空的" };
+    return { live: await fetchLiveMany(body.tickers) };
+  }
   const ticker = String(body?.ticker ?? "").trim();
-  if (!ticker) return { error: "缺少 ticker" };
+  if (!ticker) return { error: "缺少 ticker 或 tickers" };
   return { live: await fetchLive(ticker) };
 }
 

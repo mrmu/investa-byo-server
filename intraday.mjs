@@ -338,10 +338,24 @@ export async function fetchLive(ticker) {
 }
 
 async function fetchQuote(ex, label, isEtf) {
+  try {
+    const data = await httpGetJson(`${MIS_BASE}?ex_ch=${ex}&json=1&delay=0`, { headers: UA });
+    return parseQuote((data.msgArray ?? [])[0], label, isEtf);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * MIS 的一筆 msgArray → 報價物件。
+ *
+ * 抽出來是為了讓**批次**與單檔共用同一份解析 —— 價格推導(z 常是 "-" 要退回
+ * 五檔並對齊檔位)、日期補值、real 旗標這幾件事只要有兩份實作就一定會漂移，
+ * 而漂移的症狀是「清單上的價跟個股頁差一檔」，幾乎不會有人聯想到是兩套解析。
+ */
+function parseQuote(m, label, isEtf) {
   {
-    try {
-      const data = await httpGetJson(`${MIS_BASE}?ex_ch=${ex}&json=1&delay=0`, { headers: UA });
-      const m = (data.msgArray ?? [])[0];
+    {
       if (!m) return null;
       const num = (v) => {
         const n = Number(v);
@@ -391,9 +405,69 @@ async function fetchQuote(ex, label, isEtf) {
         // 讓呼叫端知道這是真成交價還是推導價 —— 兩者品質不同,不該長得一樣
         real,
       };
-    } catch {
-      return null;
     }
   }
-  return null;
+}
+
+/**
+ * 批次即時報價 —— **一個 MIS 請求拿 N 檔**。
+ *
+ * 為什麼要有:自選股與選股清單一次要看十幾二十檔。逐檔打 /live 是 20 個
+ * 來回,在行動網路上慢得沒辦法用,而且對 MIS 也不禮貌。
+ * MIS 的 ex_ch 支援用 `|` 串接,所以 20 檔就是一個請求。
+ *
+ * 批次大小 80 是實測值(Investa 的 collect-intraday 長期用這個數字跑全市場)。
+ * 超過就分批,批次之間留 300ms —— 瞬間連打會被擋。
+ */
+export async function fetchLiveMany(tickers) {
+  const list = Array.from(
+    new Set(
+      (Array.isArray(tickers) ? tickers : [])
+        .map((t) => String(t ?? "").replace(/\.(TW|TWO)$/i, "").trim().toUpperCase())
+        .filter(Boolean),
+    ),
+  ).slice(0, 200);
+  if (list.length === 0) return [];
+
+  const codes = poolCache.codes;
+  /*
+   * 池子裡有就用池子的前綴(tse_/otc_),沒有就預設 tse_。
+   *
+   * 單檔版在找不到時會 tse_ 與 otc_ **各試一次**,批次版不能那樣做 ——
+   * 那會讓請求數翻倍。改成:第一輪用猜的,把沒拿到的收集起來，
+   * 第二輪統一用另一個前綴再打一次。最多兩個請求，而不是每檔兩個。
+   */
+  const chanOf = (bare, pref) => {
+    const known = codes.find((c) => c.endsWith(`_${bare}.tw`));
+    return known && !pref ? known : `${pref ?? "tse"}_${bare}.tw`;
+  };
+
+  const out = new Map();
+  const askRound = async (pending, pref) => {
+    const chans = pending.map((b) => [b, chanOf(b, pref)]);
+    for (let i = 0; i < chans.length; i += 80) {
+      const chunk = chans.slice(i, i + 80);
+      try {
+        const data = await httpGetJson(
+          `${MIS_BASE}?ex_ch=${chunk.map(([, c]) => c).join("|")}&json=1&delay=0`,
+          { headers: UA },
+        );
+        const byCode = new Map();
+        for (const m of data.msgArray ?? []) if (m?.c) byCode.set(String(m.c).toUpperCase(), m);
+        for (const [bare] of chunk) {
+          const q = parseQuote(byCode.get(bare), bare, isEtfCode(bare));
+          if (q) out.set(bare, q);
+        }
+      } catch {
+        /* 這一批失敗就讓它缺 —— 缺一批好過整份失敗 */
+      }
+      if (i + 80 < chans.length) await new Promise((r) => setTimeout(r, 300));
+    }
+  };
+
+  await askRound(list, null);
+  const missing = list.filter((b) => !out.has(b));
+  if (missing.length > 0) await askRound(missing, "otc");
+
+  return list.map((b) => out.get(b)).filter(Boolean);
 }
