@@ -57,11 +57,21 @@ async function fetchMisNight() {
 /** 每天一次:寫收盤快照(漲跌用 MIS 口徑)+ 累積日收盤(sparkline 用) */
 export async function collectNightFutures(pool) {
   const q = await fetchMisNight();
-  const d = String(q.CDate); // yyyymmdd —— 最後成交的**日曆日**(實測 9/10 夜間回 20260910),不是期交所開放資料那套「標記次一交易日」
+  const d = String(q.CDate); // yyyymmdd —— 夜盤時段的**開盤日曆日**(見下)
   const date = `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
-  // CDate/CTime 是最後成交的台北時間;收盤後抓到的就是收盤那筆
+  /*
+   * CDate 的語意比舊註解說的複雜:9/10 **夜間盤中**實測回 20260910(= 當時的日曆日,
+   * 也= 開盤日,午夜前兩者相同分不出來);但 2026-09-16 06:00 **收盤後**實測回
+   * CDate=20260915、CTime=045957 —— 凌晨的成交,CDate 仍標**開盤日**。
+   * 直接拼 date+time 會把時間戳往前錯一天,app 的「更新時間」因此顯示成前一天凌晨。
+   * 所以:CTime 在 00:00–05:59(夜盤只有凌晨這段跨日)時,日曆日要 +1。
+   */
   const t = String(q.CTime || "050000").padStart(6, "0");
-  const quoteAt = `${date}T${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}+08:00`;
+  const quoteDate =
+    t < "060000"
+      ? new Date(Date.parse(`${date}T00:00:00Z`) + 86400_000).toISOString().slice(0, 10)
+      : date;
+  const quoteAt = `${quoteDate}T${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}+08:00`;
 
   await pool.query(
     `INSERT INTO byo_futures_quote (key, price, change, change_pct, quote_at, fetched_at)
