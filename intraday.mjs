@@ -25,13 +25,16 @@
  */
 
 import { httpGetJson } from "./http-get.mjs";
+import { createMisGuard } from "./mis-guard.mjs";
 
-const MIS_BASE = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp";
+// 可用環境變數覆寫,只為了能對假 MIS 測熔斷;正式運行不設
+const MIS_BASE = process.env.MIS_BASE || "https://mis.twse.com.tw/stock/api/getStockInfo.jsp";
 const UA = { "User-Agent": "Mozilla/5.0 (byo-worker)" };
+const env = (k, d) => Number(process.env[k] || d);
 const BATCH = 80;
-const SAMPLES = 2; // 每分鐘取樣次數
+const SAMPLES = env("MIS_SAMPLES", 2); // 每分鐘取樣次數
 const SAMPLE_GAP_MS = 12_000;
-const BATCH_GAP_MS = 500;
+const BATCH_GAP_MS = env("MIS_BATCH_GAP_MS", 800);
 /**
  * 同時送幾批。
  *
@@ -40,15 +43,22 @@ const BATCH_GAP_MS = 500;
  * 但實際是 3.3 分 K,而且分鐘標籤不連續。
  * 每輪之間有 intradayBusy 擋著,所以慢的代價不是重疊而是**跳過**。
  *
- * 5 是保守值:MIS 沒有公布速率限制,而超過會回空殼不會回錯誤
- *(那正是最難察覺的失敗)。realPct 與 bars 兩個指標會反映惡化,
- * 明天看過再決定要不要再往上調。
+ * MIS 沒有公布速率限制,而超過會回空殼不會回錯誤(那正是最難察覺的失敗)。
+ * 2026-10-05 以 5 併發、間隔 500ms 跑了將近一個月後,IP 被 MIS 封鎖。
+ * 降為 3 併發、間隔 800ms:一個 sample 約 10 波 × 1.4 秒 ≈ 14 秒,
+ * 兩個 sample 加間隔約 40 秒,仍在一分鐘內。三個參數都可用環境變數調,不必改碼重建。
  */
-const BATCH_CONCURRENCY = 5;
+const BATCH_CONCURRENCY = env("MIS_BATCH_CONCURRENCY", 3);
 const EMPTY_ALERT_ROUNDS = 5;
+/** MIS 正常回應在 1 秒內;等 30 秒(http-get 預設)只會讓被封時一輪拖到好幾分鐘 */
+const MIS_TIMEOUT_MS = 10_000;
+/** 一輪內連續幾批失敗就中止整輪 —— 零星一批 502 不算,連兩批就是對方在拒絕 */
+const ABORT_AFTER_FAILS = 2;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(`[byo-intraday ${new Date().toISOString().slice(11, 19)}]`, ...a);
+// 整輪中止一次就熔斷(1→2→4→8→15 分鐘),見 mis-guard.mjs
+const guard = createMisGuard({ name: "byo-intraday", tripAfter: 1, log: (m) => log(m) });
 
 // ─── 檔位（從 Investa 的 src/lib/tick-size.ts 移植）─────────────
 //
@@ -139,29 +149,49 @@ const lastReal = new Map();
 let lastRealDate = "";
 let emptyRounds = 0;
 
+/**
+ * 一次全市場快照。連續 ABORT_AFTER_FAILS 批失敗就中止,回 `abortReason`,
+ * 剩下的批**不再送** —— 2026-10-05 被封時,舊版每輪照樣送滿 30 批,
+ * 9 分鐘打了 542 次 hang up。
+ */
 async function fetchSnapshots(misCodes, anchorBy) {
-  const out = [];
+  const snaps = [];
   const chunks = [];
   for (let i = 0; i < misCodes.length; i += BATCH) chunks.push(misCodes.slice(i, i + BATCH));
 
+  let failRun = 0;
   // 分波並行:每波 BATCH_CONCURRENCY 批,波與波之間仍留間隔
   for (let w = 0; w < chunks.length; w += BATCH_CONCURRENCY) {
     const wave = chunks.slice(w, w + BATCH_CONCURRENCY);
     const results = await Promise.all(wave.map((c) => fetchBatch(c)));
-    for (const rows of results) out.push(...rows.map((r) => toSnap(r, anchorBy)).filter(Boolean));
+    for (const { rows, error } of results) {
+      if (error) {
+        failRun++;
+        if (failRun >= ABORT_AFTER_FAILS) return { snaps, abortReason: error };
+        continue;
+      }
+      failRun = 0;
+      snaps.push(...rows.map((r) => toSnap(r, anchorBy)).filter(Boolean));
+    }
     if (w + BATCH_CONCURRENCY < chunks.length) await sleep(BATCH_GAP_MS);
   }
-  return out;
+  return { snaps, abortReason: null };
 }
 
 async function fetchBatch(chunk) {
   try {
     // ⚠️ 用 node:https 而不是 fetch —— undici 對 MIS 一律 ECONNRESET（見 http-get.mjs）
-    const data = await httpGetJson(`${MIS_BASE}?ex_ch=${chunk.join("|")}&json=1&delay=0`, { headers: UA });
-    return data.msgArray ?? [];
+    const data = await httpGetJson(`${MIS_BASE}?ex_ch=${chunk.join("|")}&json=1&delay=0`, {
+      headers: UA,
+      timeoutMs: MIS_TIMEOUT_MS,
+    });
+    const rows = data.msgArray ?? [];
+    // 整批 80 檔一列都沒有 = 空殼回應,MIS 超速時就是這樣回(不報錯),當失敗算
+    if (rows.length === 0) return { rows, error: "空殼回應" };
+    return { rows, error: null };
   } catch (e) {
     log("MIS batch error:", e.message);
-    return [];
+    return { rows: [], error: e.message };
   }
 }
 
@@ -228,6 +258,9 @@ export async function collectIntraday(pool) {
     lastRealDate = date;
   }
 
+  // 熔斷冷卻中:這一分鐘不送任何請求(熔斷當下已大聲 log 過,這裡不再逐分鐘洗版)
+  if (!guard.allow()) return { written: 0, realPct: 0 };
+
   const codes = await buildPool(date);
   if (codes.length === 0) return null;
 
@@ -246,7 +279,10 @@ export async function collectIntraday(pool) {
   let nSnap = 0;
   let nReal = 0;
   for (let s = 0; s < SAMPLES; s++) {
-    for (const snap of await fetchSnapshots(codes, anchorBy)) {
+    const { snaps, abortReason } = await fetchSnapshots(codes, anchorBy);
+    if (abortReason) guard.failure(abortReason);
+    else guard.success();
+    for (const snap of snaps) {
       nSnap++;
       if (snap.real) nReal++;
       anchorBy.set(snap.ticker, snap.price);
@@ -262,6 +298,7 @@ export async function collectIntraday(pool) {
         a.cumLots = Math.max(a.cumLots, snap.cumLots);
       }
     }
+    if (abortReason) break; // 已經中止的那一輪,第二個 sample 不必再打;收到的部分照寫
     if (s < SAMPLES - 1) await sleep(SAMPLE_GAP_MS);
   }
 
@@ -322,7 +359,27 @@ export async function collectIntraday(pool) {
  */
 const INDEX_MIS = { TAIEX: "tse_t00.tw", TPEX: "otc_o00.tw" };
 
+/**
+ * /live 走 server 行程,與收集迴圈是不同行程、各有一份熔斷狀態。
+ * 單一請求零星失敗很常見,所以連續 3 次才熔斷;熔斷中直接回 null(畫面顯示無即時價),
+ * 不把手機的每 5 秒輪詢轉成對 MIS 的猛打。
+ */
+const liveGuard = createMisGuard({ name: "byo-live", tripAfter: 3, log: (m) => log(m) });
+/** 同一檔 3 秒內重複查直接回快取 —— 多支手機同看一檔時,MIS 只被打一次 */
+const LIVE_TTL_MS = 3_000;
+const liveCache = new Map();
+
 export async function fetchLive(ticker) {
+  const key = String(ticker ?? "").trim().toUpperCase();
+  const hit = liveCache.get(key);
+  if (hit && Date.now() - hit.at < LIVE_TTL_MS) return hit.data;
+  const data = await fetchLiveUncached(ticker);
+  liveCache.set(key, { at: Date.now(), data });
+  if (liveCache.size > 2000) liveCache.clear();
+  return data;
+}
+
+async function fetchLiveUncached(ticker) {
   const raw = String(ticker ?? "").trim().toUpperCase();
   if (INDEX_MIS[raw]) return fetchQuote(INDEX_MIS[raw], raw, false);
   const bare = String(ticker ?? "").replace(/\.(TW|TWO)$/i, "").trim();
@@ -338,10 +395,16 @@ export async function fetchLive(ticker) {
 }
 
 async function fetchQuote(ex, label, isEtf) {
+  if (!liveGuard.allow()) return null;
   try {
-    const data = await httpGetJson(`${MIS_BASE}?ex_ch=${ex}&json=1&delay=0`, { headers: UA });
+    const data = await httpGetJson(`${MIS_BASE}?ex_ch=${ex}&json=1&delay=0`, {
+      headers: UA,
+      timeoutMs: MIS_TIMEOUT_MS,
+    });
+    liveGuard.success(); // 查無此檔(空 msgArray)也是 MIS 正常回應,不算失敗
     return parseQuote((data.msgArray ?? [])[0], label, isEtf);
-  } catch {
+  } catch (e) {
+    liveGuard.failure(e.message);
     return null;
   }
 }
@@ -446,20 +509,23 @@ export async function fetchLiveMany(tickers) {
   const askRound = async (pending, pref) => {
     const chans = pending.map((b) => [b, chanOf(b, pref)]);
     for (let i = 0; i < chans.length; i += 80) {
+      if (!liveGuard.allow()) return;
       const chunk = chans.slice(i, i + 80);
       try {
         const data = await httpGetJson(
           `${MIS_BASE}?ex_ch=${chunk.map(([, c]) => c).join("|")}&json=1&delay=0`,
-          { headers: UA },
+          { headers: UA, timeoutMs: MIS_TIMEOUT_MS },
         );
+        liveGuard.success();
         const byCode = new Map();
         for (const m of data.msgArray ?? []) if (m?.c) byCode.set(String(m.c).toUpperCase(), m);
         for (const [bare] of chunk) {
           const q = parseQuote(byCode.get(bare), bare, isEtfCode(bare));
           if (q) out.set(bare, q);
         }
-      } catch {
+      } catch (e) {
         /* 這一批失敗就讓它缺 —— 缺一批好過整份失敗 */
+        liveGuard.failure(e.message);
       }
       if (i + 80 < chans.length) await new Promise((r) => setTimeout(r, 300));
     }
