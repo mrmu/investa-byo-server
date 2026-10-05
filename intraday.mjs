@@ -32,7 +32,14 @@ const MIS_BASE = process.env.MIS_BASE || "https://mis.twse.com.tw/stock/api/getS
 const UA = { "User-Agent": "Mozilla/5.0 (byo-worker)" };
 const env = (k, d) => Number(process.env[k] || d);
 const BATCH = 80;
-const SAMPLES = env("MIS_SAMPLES", 2); // 每分鐘取樣次數
+/**
+ * 每分鐘取樣次數。
+ *
+ * 原本 2 次(一根 K 有兩個點,看得到分鐘內的高低)。2026-10-05 降速後實測一輪要 80 秒以上,
+ * 超過一分鐘 → intradayBusy 跳過下一輪,實際收到的是 2 分 K。改 1 次:一輪約 40 秒、
+ * 請求量減半(也比較不會再被 MIS 封);代價是每根 K 的開高低收是同一個價。
+ */
+const SAMPLES = env("MIS_SAMPLES", 1);
 const SAMPLE_GAP_MS = 12_000;
 const BATCH_GAP_MS = env("MIS_BATCH_GAP_MS", 800);
 /**
@@ -45,8 +52,8 @@ const BATCH_GAP_MS = env("MIS_BATCH_GAP_MS", 800);
  *
  * MIS 沒有公布速率限制,而超過會回空殼不會回錯誤(那正是最難察覺的失敗)。
  * 2026-10-05 以 5 併發、間隔 500ms 跑了將近一個月後,IP 被 MIS 封鎖。
- * 降為 3 併發、間隔 800ms:一個 sample 約 10 波 × 1.4 秒 ≈ 14 秒,
- * 兩個 sample 加間隔約 40 秒,仍在一分鐘內。三個參數都可用環境變數調,不必改碼重建。
+ * 降為 3 併發、間隔 800ms。正式機實測一個 sample 約 40 秒(MIS 真實延遲遠高於本機假伺服器),
+ * 所以 SAMPLES 只能是 1。三個參數都可用環境變數調(compose 已傳入),改 .env 後重建即可。
  */
 const BATCH_CONCURRENCY = env("MIS_BATCH_CONCURRENCY", 3);
 const EMPTY_ALERT_ROUNDS = 5;

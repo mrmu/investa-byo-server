@@ -46,6 +46,10 @@ services:
       FINMIND_TOKEN: ${BYO_FINMIND_TOKEN:?請先設定 BYO_FINMIND_TOKEN}
       BACKFILL_DAYS: ${BACKFILL_DAYS:-1095}
       BACKFILL_MAX_PER_RUN: ${BACKFILL_MAX_PER_RUN:-40}
+      # 盤中 MIS 取樣速率(預設值見 intraday.mjs;空字串 = 用預設)
+      MIS_SAMPLES: ${MIS_SAMPLES:-}
+      MIS_BATCH_CONCURRENCY: ${MIS_BATCH_CONCURRENCY:-}
+      MIS_BATCH_GAP_MS: ${MIS_BATCH_GAP_MS:-}
     depends_on:
       byodb:
         condition: service_healthy
