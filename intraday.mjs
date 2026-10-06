@@ -57,8 +57,12 @@ const BATCH_GAP_MS = env("MIS_BATCH_GAP_MS", 800);
  */
 const BATCH_CONCURRENCY = env("MIS_BATCH_CONCURRENCY", 3);
 const EMPTY_ALERT_ROUNDS = 5;
-/** MIS 正常回應在 1 秒內;等 30 秒(http-get 預設)只會讓被封時一輪拖到好幾分鐘 */
-const MIS_TIMEOUT_MS = 10_000;
+/**
+ * MIS 平常 1 秒內回應;等 30 秒(http-get 預設)只會讓被封時一輪拖到好幾分鐘。
+ * 但開盤尖峰會慢到 10 秒以上:2026-10-06 09:13 兩批 10 秒逾時 → 誤觸熔斷,丟了 4 分鐘。
+ * 放寬到 15 秒。被封時是立刻斷線(socket hang up),不會等到逾時,所以不影響熔斷保護。
+ */
+const MIS_TIMEOUT_MS = 15_000;
 /** 一輪內連續幾批失敗就中止整輪 —— 零星一批 502 不算,連兩批就是對方在拒絕 */
 const ABORT_AFTER_FAILS = 2;
 

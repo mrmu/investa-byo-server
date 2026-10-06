@@ -585,18 +585,32 @@ const runIndexHistory = async () => {
 runIndexHistory();
 setInterval(runIndexHistory, 3600_000);
 
-let intradayBusy = false;
-setInterval(async () => {
-  if (intradayBusy) return; // 一輪要 ~25 秒,重疊會讓兩輪互相覆寫量能差分
-  intradayBusy = true;
-  try {
-    await collectIntraday(pool);
-  } catch (e) {
-    log("盤中收集異常:", e.message);
-  } finally {
-    intradayBusy = false;
+/**
+ * 盤中收集:連續迴圈,一輪跑完就接下一輪,同一分鐘不跑兩次。
+ *
+ * 原本是 setInterval 60 秒 + busy 旗標:一輪只要超過 60 秒,下一次觸發就整個跳過,
+ * 要再等一分鐘 —— 超時幾秒就丟一整分鐘。2026-10-06 開盤實測一輪 30–70 秒,
+ * 22 分鐘只收到 15 分鐘。改成迴圈後,慢的那輪只會讓後面往後推,不會整分鐘丟掉。
+ * 一輪不重疊(量能差分依賴上一輪落庫)這點不變。
+ */
+const twMinute = () => new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 16);
+(async function intradayLoop() {
+  let lastMinute = "";
+  for (;;) {
+    const minute = twMinute();
+    if (minute === lastMinute) {
+      // 這一分鐘已經跑過 → 睡到下一分鐘開頭(+1 秒緩衝)
+      await new Promise((r) => setTimeout(r, 61_000 - (Date.now() % 60_000)));
+      continue;
+    }
+    lastMinute = minute;
+    try {
+      await collectIntraday(pool);
+    } catch (e) {
+      log("盤中收集異常:", e.message);
+    }
   }
-}, 60_000);
+})();
 setInterval(async () => {
   try {
     const now = new Date(Date.now() + 8 * 3600_000);
