@@ -161,12 +161,30 @@ let lastRealDate = "";
 let emptyRounds = 0;
 
 /**
+ * 休市判定:看 MIS 回的報價日期(`d`),不看行事曆。
+ *
+ * MIS 在休市日照常回應,回的是**上一個交易日**的最後報價 —— 2026-09-25(中秋)、
+ * 09-28(教師節)、10-09(國慶連假)三天,舊版每分鐘把那份舊報價寫成一根 K,
+ * 一天 274 根價格完全不動的假 K,會把分 K 的長均線拉平(10/13 金包銀回測時發現)。
+ * 用 `d` 判斷還能涵蓋颱風假這種行事曆上沒有的臨時休市。
+ *
+ * 每一筆快照都檢查 `d`,不是今天的一律不寫 —— 所以判定休市之前也不會落庫任何舊價。
+ * 開盤前幾分鐘 `d` 可能還沒翻日,所以要過了 STALE_GRACE_HM 且連續 STALE_ROUNDS 輪
+ * 整輪都是舊日期,才認定今天休市、停止送請求(省 MIS 額度)。
+ */
+const STALE_GRACE_HM = "09:05";
+const STALE_ROUNDS = 3;
+let staleRounds = 0;
+let closedDay = "";
+
+/**
  * 一次全市場快照。連續 ABORT_AFTER_FAILS 批失敗就中止,回 `abortReason`,
  * 剩下的批**不再送** —— 2026-10-05 被封時,舊版每輪照樣送滿 30 批,
  * 9 分鐘打了 542 次 hang up。
  */
-async function fetchSnapshots(misCodes, anchorBy) {
+async function fetchSnapshots(misCodes, anchorBy, quoteDay) {
   const snaps = [];
+  let stale = 0;
   const chunks = [];
   for (let i = 0; i < misCodes.length; i += BATCH) chunks.push(misCodes.slice(i, i + BATCH));
 
@@ -178,15 +196,23 @@ async function fetchSnapshots(misCodes, anchorBy) {
     for (const { rows, error } of results) {
       if (error) {
         failRun++;
-        if (failRun >= ABORT_AFTER_FAILS) return { snaps, abortReason: error };
+        if (failRun >= ABORT_AFTER_FAILS) return { snaps, stale, abortReason: error };
         continue;
       }
       failRun = 0;
-      snaps.push(...rows.map((r) => toSnap(r, anchorBy)).filter(Boolean));
+      for (const r of rows) {
+        // 報價日期不是今天 = 休市日回的舊報價(或該檔今天還沒有資料),不能當今天的 K
+        if (String(r.d ?? "") !== quoteDay) {
+          stale++;
+          continue;
+        }
+        const snap = toSnap(r, anchorBy);
+        if (snap) snaps.push(snap);
+      }
     }
     if (w + BATCH_CONCURRENCY < chunks.length) await sleep(BATCH_GAP_MS);
   }
-  return { snaps, abortReason: null };
+  return { snaps, stale, abortReason: null };
 }
 
 async function fetchBatch(chunk) {
@@ -267,7 +293,9 @@ export async function collectIntraday(pool) {
   if (date !== lastRealDate) {
     lastReal.clear(); // 跨日：昨天的成交價不可沿用
     lastRealDate = date;
+    staleRounds = 0;
   }
+  if (closedDay === date) return null; // 已判定今天休市
 
   // 熔斷冷卻中:這一分鐘不送任何請求(熔斷當下已大聲 log 過,這裡不再逐分鐘洗版)
   if (!guard.allow()) return { written: 0, realPct: 0 };
@@ -289,8 +317,11 @@ export async function collectIntraday(pool) {
   const bars = new Map();
   let nSnap = 0;
   let nReal = 0;
+  let nStale = 0;
+  const quoteDay = date.replaceAll("-", "");
   for (let s = 0; s < SAMPLES; s++) {
-    const { snaps, abortReason } = await fetchSnapshots(codes, anchorBy);
+    const { snaps, stale, abortReason } = await fetchSnapshots(codes, anchorBy, quoteDay);
+    nStale += stale;
     if (abortReason) guard.failure(abortReason);
     else guard.success();
     for (const snap of snaps) {
@@ -312,6 +343,17 @@ export async function collectIntraday(pool) {
     if (abortReason) break; // 已經中止的那一輪,第二個 sample 不必再打;收到的部分照寫
     if (s < SAMPLES - 1) await sleep(SAMPLE_GAP_MS);
   }
+
+  // 整輪只收到舊日期的報價 → 很可能是休市日。這不是「收不到資料」,不能走下面的告警
+  if (bars.size === 0 && nStale > 0) {
+    staleRounds++;
+    if (hm >= STALE_GRACE_HM && staleRounds >= STALE_ROUNDS) {
+      closedDay = date;
+      log(`${date} MIS 報價日期連續 ${staleRounds} 輪都不是今天 → 判定休市,今天不再收集`);
+    }
+    return { written: 0, realPct: 0 };
+  }
+  staleRounds = 0;
 
   if (bars.size === 0) {
     emptyRounds++;
