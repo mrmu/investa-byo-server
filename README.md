@@ -95,6 +95,7 @@ docker compose exec byo node server.mjs --revoke <id>    # 撤銷
 | `POST /match` | 給一個積木條件與期間，回**符合的鍵值**（不是原始資料） |
 | `POST /series` | 單檔的整段序列（K 線副圖、籌碼分析用） |
 | `POST /quote` | 一批股票的最新一日籌碼（籌碼速覽用） |
+| `GET /predictions` | 預測市場機率（Polymarket，一天一次快照；追蹤清單在 `predictions-config.mjs`） |
 | `GET /health` | 健康檢查（免金鑰） |
 
 `/match` 回鍵值而不是回資料，是刻意的：三年區間的原始明細有 336 萬列，
@@ -103,6 +104,11 @@ docker compose exec byo node server.mjs --revoke <id>    # 撤銷
 
 `coverage` 是必填欄位：這台只有一年歷史時，app 會據此縮短回測期並在畫面標示，
 而不是假裝有三年。
+
+`/predictions` 的資料來自 Polymarket 的免金鑰公開 API。它的服務條款禁止金融科技公司、
+市場資料散布者存取或轉散布 —— 所以 Investa 不碰它，由這台為**你的個人用途**抓取。
+要增減追蹤的事件就改 `predictions-config.mjs` 一個檔；⚠️ 不要加入台灣選舉相關的市場
+（在台灣對選舉下注違法）。手動跑一輪：`docker compose exec byoworker node worker.mjs --predictions`。
 
 完整契約見 Investa 的 `docs/BYO_SERVER_SPEC.md`。
 你可以自己實作這幾個端點，不一定要用這份參考實作 ——

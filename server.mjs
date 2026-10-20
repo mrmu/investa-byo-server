@@ -24,6 +24,7 @@ import { readNightFutures } from "./futures.mjs";
 import { readMacro } from "./macro.mjs";
 import { fetchLive, fetchLiveMany } from "./intraday.mjs";
 import { readIndexHistory } from "./index-history.mjs";
+import { readPredictions } from "./predictions.mjs";
 
 const PORT = Number(process.env.PORT || 8088);
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
@@ -99,6 +100,7 @@ const CAPABILITIES = [
   { id: "live_quote", label: "個股即時報價（MIS）" },
   { id: "index_history", label: "加權／櫃買指數完整日 K" },
   { id: "industry_taxonomy", label: "產業細分類" },
+  { id: "predictions", label: "預測市場機率（Polymarket）" },
 ];
 
 /** pg 會把 date 欄位轉成 JS Date;String(Date) 會給 "Wed Aug 05" 這種格式,必須明確轉 ISO */
@@ -473,6 +475,10 @@ createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/macro") {
       return json(res, 200, { macro: await readMacro(pool) }, req);
+    }
+    if (req.method === "GET" && url.pathname === "/predictions") {
+      // 預測市場機率（Polymarket，個人用途；Investa 不得抓取或轉散布 —— 見 predictions.mjs 檔頭）
+      return json(res, 200, await readPredictions(pool), req);
     }
     if (req.method === "POST" && url.pathname === "/live") {
       const out = await handleLive(await readJson(req));

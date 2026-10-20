@@ -20,6 +20,7 @@ import { collectMacro } from "./macro.mjs";
 import { collectIndexHistory } from "./index-history.mjs";
 import { collectNightFutures } from "./futures.mjs";
 import { ensureIndustrySchema, refreshIndustry } from "./industry.mjs";
+import { collectPredictions, hasTodaySnapshot } from "./predictions.mjs";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 4 });
 const FINMIND_TOKEN = process.env.FINMIND_TOKEN || "";
@@ -346,6 +347,12 @@ if (process.argv[2] === "--once") {
   await pool.end();
   process.exit(0);
 }
+// 手動抓一次預測市場(部署驗證用)
+if (process.argv[2] === "--predictions") {
+  await collectPredictions(pool);
+  await pool.end();
+  process.exit(0);
+}
 // 手動抓一次夜盤快照(部署驗證用;不受 06:00–14:59 窗口限制 —— 夜盤時段抓到的是盤中價)
 if (process.argv[2] === "--night") {
   await collectNightFutures(pool);
@@ -564,6 +571,52 @@ setInterval(async () => {
     log("夜盤快照失敗:", e.message);
   }
 }, 60_000);
+
+/**
+ * 預測市場(Polymarket):每天一次,台北時間 08:00 後(美股收盤之後、台股開盤之前)。
+ * 啟動時若今天還沒有快照就先補一輪(不等 08:00)—— 新部署或容器重啟後不必空等一天。
+ *
+ * 以 byo_job_run 的 last_date 判斷「今天跑過沒」,與夜盤快照同一套做法,重啟不會重複跑。
+ * 全部事件都失敗(多半是網路或對方掛了)時不記 last_date,但一小時內不重試 ——
+ * 每 10 分鐘的 tick 不該變成每 10 分鐘猛打一次。
+ */
+let predictionsBusy = false;
+let predictionsLastTry = 0;
+async function runPredictions({ force = false } = {}) {
+  if (predictionsBusy) return;
+  if (!force && Date.now() - predictionsLastTry < 3600_000) return;
+  predictionsBusy = true;
+  predictionsLastTry = Date.now();
+  try {
+    const r = await collectPredictions(pool);
+    if (r.ok > 0) {
+      await pool.query(
+        `INSERT INTO byo_job_run (job, last_date, last_ok_at, last_error) VALUES ('predictions', $1, now(), $2)
+         ON CONFLICT (job) DO UPDATE SET last_date = EXCLUDED.last_date, last_ok_at = now(), last_error = EXCLUDED.last_error`,
+        [twDate(), r.failed ? `${r.failed} 個事件失敗` : null],
+      );
+    }
+  } catch (e) {
+    log("預測市場更新異常:", e.message);
+  } finally {
+    predictionsBusy = false;
+  }
+}
+hasTodaySnapshot(pool)
+  .then((has) => (has ? null : runPredictions({ force: true })))
+  .catch((e) => log("預測市場啟動檢查異常:", e.message));
+setInterval(async () => {
+  try {
+    const twH = new Date(Date.now() + 8 * 3600_000).getUTCHours();
+    if (twH < 8) return;
+    const { rows } = await pool.query(`SELECT last_date FROM byo_job_run WHERE job = 'predictions'`);
+    const last = rows[0]?.last_date ? new Date(rows[0].last_date).toISOString().slice(0, 10) : null;
+    if (last === twDate()) return;
+    await runPredictions();
+  } catch (e) {
+    log("預測市場排程失敗:", e.message);
+  }
+}, 10 * 60_000);
 
 /**
  * 指數日 K 歷史(加權/櫃買)。每輪最多 12 個月份 —— 連打幾十個月會被 rwd 限流,
